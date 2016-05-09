@@ -19,9 +19,10 @@ import org.jsoup.nodes.{Document => jsDocument, Element => jsElement}
 import spray.json._
 
 import scala.collection.immutable.{Seq => imSeq}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.concurrent.{Await, Future, Promise}
 import scala.util.{Failure, Success, Try}
+
 
 object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
 
@@ -45,12 +46,16 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
   private val poolClientFlow = initialize()
   private val queue = Source.queue[(HttpRequest, (Any, Promise[(Try[HttpResponse], Any)]))](1000, OverflowStrategy.backpressure)
     .via(poolClientFlow)
+    .mapAsync(4){ //This parallelism factor can probably be configurable too
+      case (util.Success(resp), any) =>
+        val strictFut = resp.entity.toStrict(5 seconds) //probably need to make this more configurable
+        strictFut.map(ent => (util.Success(resp.copy(entity = ent)), any))
+      case other =>
+        Future.successful(other)
+    }
     .toMat(Sink.foreach({
       case (triedResp, (value: Any, p: Promise[(Try[HttpResponse], Any)])) =>
-        println(s"Response was received ${value.toString}")
-        val x = triedResp.get.entity.dataBytes.toMat(Sink.seq)(Keep.right).run() // consume dataBytes, which is also a source
-        x map { e => p.success(triedResp -> value); println(s"Received ${e.length} bytes for ID ${value.toString}" ) }
-//        p.success(triedResp -> value)
+        p.success(triedResp -> value)
       case _ =>
         throw new RuntimeException()
     }))(Keep.left)
@@ -132,7 +137,6 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
   private def getNewsPathPrint(newsId: Long): String = s"/viewarticle/${newsId}_print"
 
   private def parseResponse[TR](response: Future[(Try[HttpResponse], RequestContext)], redirectCount: Int = 0)(implicit unmarshaller: FromEntityUnmarshaller[TR]): Future[TR] = {
-
     def handleRedirect(resp: HttpResponse, reqContext: RequestContext): Future[TR] = {
       resp.header[Location] match {
         case Some(value) =>
@@ -161,8 +165,10 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
           case Success(res) =>
             res.status match {
               case OK =>
+                
                 unmarshaller(res.entity).recoverWith {
                   case ex =>
+                    println("Fail: " + ex.getMessage)
                     Unmarshal(res.entity).to[String].flatMap { body =>
                       Future.failed(new IOException(s"Failed to unmarshal with ${ex.getMessage} and response body is\n $body"))
                     }
